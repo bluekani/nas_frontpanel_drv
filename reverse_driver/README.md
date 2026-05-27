@@ -4,6 +4,7 @@ This is a clean-room replacement driver based on reverse engineering findings fr
 
 Implemented scope:
 - Poll GPIO buttons: `func`, `power`, `reset`, `select`, `enter`
+- Poll low-level Super I/O GPIO lines (`msGpioGet` compatible path)
 - Emit Linux input key events
 - Optionally invoke usermode helper:
   - `/mnt/data/libexec/button/sw_handler --type <name> --second <sec>`
@@ -49,6 +50,38 @@ sudo insmod nas_frontpanel_drv.ko \
   invoke_sw_handler=1
 ```
 
+Low-level Super I/O backend example (no Linux gpiochip required):
+
+```sh
+sudo insmod nas_frontpanel_drv.ko \
+  button_gpios=-1,-1,-1,-1,-1 \
+  msio_button_lines=12,13,14,15,16 \
+  use_msio_backend=1 \
+  active_low=1,1,1,1,1 \
+  poll_interval_ms=250 \
+  invoke_sw_handler=1
+```
+
+Autodiscovery mode (to find unknown line numbers):
+
+```sh
+sudo insmod nas_frontpanel_drv.ko \
+  button_gpios=-1,-1,-1,-1,-1 \
+  msio_button_lines=-1,-1,-1,-1,-1 \
+  use_msio_backend=1 \
+  msio_autodiscover=1
+dmesg -w
+```
+
+Press front-panel buttons and map lines from logs like:
+
+```text
+nas_frontpanel_drv: msio line 23 changed -> 0
+nas_frontpanel_drv: msio line 23 changed -> 1
+```
+
+Then reload with `msio_button_lines=` set to discovered line numbers.
+
 ## Validate
 
 - Input events:
@@ -73,6 +106,8 @@ setLED POWER GREEN ON
 ## Notes
 
 - GPIO numbers are board-specific; set `button_gpios=` accordingly.
+- If Linux GPIO is unavailable on your board, use `msio_button_lines=` and `use_msio_backend=1`.
+- `msio_index_port=-1` auto-detects `0x2e/0x4e`; `msio_gpio_base=-1` auto-detects from SIO regs `0x62/0x63`.
 - Threshold ticks are reverse-engineered defaults: `8,4,32,4,4`.
 - Current remote host check (2026-05-28): no `/lib/modules/$(uname -r)/build` and no `gcc/make`,
   so module build is blocked until prerequisites are installed.

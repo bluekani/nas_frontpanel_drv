@@ -21,10 +21,20 @@
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/ioport.h>
+#include <linux/spinlock.h>
+#include <asm/io.h>
 
 #define DRV_NAME "nas_frontpanel_drv"
 #define BTN_COUNT 5
 #define NAS_DISK_MAX 6
+
+#define BACKEND_NONE 0
+#define BACKEND_GPIO 1
+#define BACKEND_MSIO 2
+
+#define IT87_CHIP_ID 0x8728
+#define IT87_LDN_GPIO 0x07
 
 /* Recovered nas_ctrl ioctl values */
 #define NAS_CTRL_IOW_SET_LED          0x400c6702u
@@ -62,26 +72,43 @@ static unsigned int threshold_ticks[BTN_COUNT] = {8, 4, 32, 4, 4};
 
 static int button_gpios[BTN_COUNT] = {-1, -1, -1, -1, -1};
 static int active_low[BTN_COUNT] = {1, 1, 1, 1, 1};
+static int msio_button_lines[BTN_COUNT] = {-1, -1, -1, -1, -1};
 static unsigned int poll_interval_ms = 250;
 static bool invoke_sw_handler = true;
 static char *sw_handler_path = "/mnt/data/libexec/button/sw_handler";
+static bool use_msio_backend = true;
+static int msio_index_port = -1;
+static int msio_gpio_base = -1;
+static bool msio_autodiscover = true;
 
 module_param_array(button_gpios, int, NULL, 0644);
 MODULE_PARM_DESC(button_gpios, "GPIO numbers for func,power,reset,select,enter");
 module_param_array(active_low, int, NULL, 0644);
 MODULE_PARM_DESC(active_low, "Active-low flags (0/1) for func,power,reset,select,enter");
+module_param_array(msio_button_lines, int, NULL, 0644);
+MODULE_PARM_DESC(msio_button_lines, "MSIO line numbers for func,power,reset,select,enter");
 module_param(poll_interval_ms, uint, 0644);
 MODULE_PARM_DESC(poll_interval_ms, "Polling interval in milliseconds");
 module_param(invoke_sw_handler, bool, 0644);
 MODULE_PARM_DESC(invoke_sw_handler, "Call usermode helper on button action");
 module_param(sw_handler_path, charp, 0644);
 MODULE_PARM_DESC(sw_handler_path, "Path to sw_handler executable");
+module_param(use_msio_backend, bool, 0644);
+MODULE_PARM_DESC(use_msio_backend, "Enable low-level Super I/O msGpioGet-compatible backend");
+module_param(msio_index_port, int, 0644);
+MODULE_PARM_DESC(msio_index_port, "Super I/O index port (0x2e or 0x4e). -1 means auto detect");
+module_param(msio_gpio_base, int, 0644);
+MODULE_PARM_DESC(msio_gpio_base, "GPIO IO base override. -1 means auto detect from Super I/O regs 0x62/0x63");
+module_param(msio_autodiscover, bool, 0644);
+MODULE_PARM_DESC(msio_autodiscover, "Log low-level line changes for mapping discovery when button lines are unknown");
 
 struct btn_state {
     bool valid;
     bool pressed;
     bool fired;
     u32 ticks;
+    u8 backend;
+    int line;
 };
 
 struct nas_led_ioctl {
@@ -111,6 +138,13 @@ static DEFINE_MUTEX(state_lock);
 static struct proc_dir_entry *proc_nas_ctrl;
 static struct proc_dir_entry *proc_buttons;
 static struct miscdevice nas_ctrl_miscdev;
+
+static bool msio_ready;
+static u8 msio_idx;
+static u16 msio_base;
+static DEFINE_SPINLOCK(msio_lock);
+static bool msio_prev_valid;
+static u8 msio_prev[9];
 
 static char last_type[16] = "none";
 static u32 last_second;
@@ -163,11 +197,174 @@ static void call_sw_handler(int idx, u32 ticks)
 
 static bool gpio_pressed(int idx)
 {
-    int v = gpio_get_value_cansleep(button_gpios[idx]);
+    int v;
+
+    if (states[idx].backend != BACKEND_GPIO)
+        return false;
+
+    v = gpio_get_value_cansleep(states[idx].line);
 
     if (v < 0)
         return false;
     return active_low[idx] ? !v : !!v;
+}
+
+static bool msio_pressed(int idx)
+{
+    unsigned long flags;
+    u8 val;
+    u16 port;
+    int bit;
+
+    if (states[idx].backend != BACKEND_MSIO || !msio_ready)
+        return false;
+
+    if (states[idx].line < 0 || states[idx].line > 0x40)
+        return false;
+
+    port = msio_base + (states[idx].line >> 3);
+    bit = states[idx].line & 7;
+
+    spin_lock_irqsave(&msio_lock, flags);
+    val = inb(port);
+    spin_unlock_irqrestore(&msio_lock, flags);
+
+    return active_low[idx] ? !((val >> bit) & 1) : !!((val >> bit) & 1);
+}
+
+static void msio_discover_changes(void)
+{
+    unsigned long flags;
+    u8 cur[9];
+    int i;
+
+    if (!msio_ready || !msio_autodiscover)
+        return;
+
+    spin_lock_irqsave(&msio_lock, flags);
+    for (i = 0; i < 9; i++)
+        cur[i] = inb(msio_base + i);
+    spin_unlock_irqrestore(&msio_lock, flags);
+
+    if (!msio_prev_valid) {
+        memcpy(msio_prev, cur, sizeof(cur));
+        msio_prev_valid = true;
+        return;
+    }
+
+    for (i = 0; i < 9; i++) {
+        u8 diff = msio_prev[i] ^ cur[i];
+        int b;
+
+        if (!diff)
+            continue;
+
+        for (b = 0; b < 8; b++) {
+            int line;
+
+            if (!(diff & BIT(b)))
+                continue;
+            line = i * 8 + b;
+            if (line > 0x40)
+                continue;
+            pr_info(DRV_NAME ": msio line %d changed -> %d\n",
+                    line, !!(cur[i] & BIT(b)));
+        }
+    }
+
+    memcpy(msio_prev, cur, sizeof(cur));
+}
+
+static void sio_enter_cfg(u8 idx_port)
+{
+    outb(0x87, idx_port);
+    outb(0x01, idx_port);
+    outb(0x55, idx_port);
+    outb(idx_port == 0x2e ? 0x55 : 0xaa, idx_port);
+}
+
+static void sio_exit_cfg(u8 idx_port)
+{
+    outb(0x02, idx_port);
+    outb(0x02, idx_port + 1);
+}
+
+static u8 sio_read(u8 idx_port, u8 reg)
+{
+    outb(reg, idx_port);
+    return inb(idx_port + 1);
+}
+
+static void sio_write(u8 idx_port, u8 reg, u8 value)
+{
+    outb(reg, idx_port);
+    outb(value, idx_port + 1);
+}
+
+static int msio_init(void)
+{
+    u8 idx_ports[2] = {0x2e, 0x4e};
+    int i;
+
+    if (msio_gpio_base >= 0) {
+        msio_base = (u16)msio_gpio_base;
+        if (!request_region(msio_base, 8, DRV_NAME ":msio"))
+            return -EBUSY;
+        msio_ready = true;
+        pr_info(DRV_NAME ": msio base forced at 0x%x\n", msio_base);
+        return 0;
+    }
+
+    if (msio_index_port >= 0) {
+        idx_ports[0] = (u8)msio_index_port;
+        idx_ports[1] = 0;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(idx_ports); i++) {
+        u8 p = idx_ports[i];
+        u16 id;
+        u8 c1;
+        u16 base;
+
+        if (!p)
+            continue;
+
+        sio_enter_cfg(p);
+        id = ((u16)sio_read(p, 0x20) << 8) | sio_read(p, 0x21);
+        if (id != IT87_CHIP_ID) {
+            sio_exit_cfg(p);
+            continue;
+        }
+
+        sio_write(p, 0x07, IT87_LDN_GPIO);
+        c1 = sio_read(p, 0xc1);
+        sio_write(p, 0xc1, c1 | 0x02);
+        base = ((u16)sio_read(p, 0x62) << 8) | sio_read(p, 0x63);
+        sio_exit_cfg(p);
+
+        if (!base)
+            continue;
+        if (!request_region(base, 8, DRV_NAME ":msio"))
+            return -EBUSY;
+
+        msio_idx = p;
+        msio_base = base;
+        msio_ready = true;
+        pr_info(DRV_NAME ": Found IT%04x at index 0x%x, gpio base 0x%x\n",
+                IT87_CHIP_ID, msio_idx, msio_base);
+        return 0;
+    }
+
+    return -ENODEV;
+}
+
+static void msio_exit(void)
+{
+    if (msio_ready)
+        release_region(msio_base, 8);
+    msio_ready = false;
+    msio_base = 0;
+    msio_prev_valid = false;
 }
 
 static int disk_to_index(u32 disk)
@@ -305,7 +502,10 @@ static void process_button(int idx)
     if (!st->valid)
         return;
 
-    now_pressed = gpio_pressed(idx);
+    if (st->backend == BACKEND_GPIO)
+        now_pressed = gpio_pressed(idx);
+    else
+        now_pressed = msio_pressed(idx);
 
     if (now_pressed) {
         if (!st->pressed) {
@@ -345,6 +545,7 @@ static void poll_work_fn(struct work_struct *work)
     mutex_lock(&state_lock);
     for (i = 0; i < BTN_COUNT; i++)
         process_button(i);
+    msio_discover_changes();
     mutex_unlock(&state_lock);
 
     schedule_delayed_work(&poll_work, msecs_to_jiffies(poll_interval_ms));
@@ -358,16 +559,22 @@ static int buttons_show(struct seq_file *m, void *v)
     seq_printf(m, "last_type=%s\n", last_type);
     seq_printf(m, "last_second=%u\n", last_second);
     seq_printf(m, "pwr_resume_state=%u\n", pwr_resume_state);
-    seq_puts(m, "name gpio active_low pressed ticks fired\n");
+    seq_printf(m, "msio_ready=%d\n", msio_ready ? 1 : 0);
+    seq_printf(m, "msio_index=0x%x\n", msio_idx);
+    seq_printf(m, "msio_base=0x%x\n", msio_base);
+    seq_puts(m, "name cfg_gpio cfg_msio active_low pressed ticks fired backend line\n");
 
     for (i = 0; i < BTN_COUNT; i++) {
-        seq_printf(m, "%s %d %d %d %u %d\n",
+        seq_printf(m, "%s %d %d %d %d %u %d %u %d\n",
                    btn_names[i],
                    button_gpios[i],
+                   msio_button_lines[i],
                    active_low[i],
                    states[i].pressed,
                    states[i].ticks,
-                   states[i].fired);
+                   states[i].fired,
+                   states[i].backend,
+                   states[i].line);
     }
     mutex_unlock(&state_lock);
     return 0;
@@ -417,9 +624,14 @@ static void release_gpios(void)
 
     for (i = 0; i < BTN_COUNT; i++) {
         if (states[i].valid)
-            gpio_free(button_gpios[i]);
+            if (states[i].backend == BACKEND_GPIO)
+                gpio_free(states[i].line);
         states[i].valid = false;
+        states[i].backend = BACKEND_NONE;
+        states[i].line = -1;
     }
+
+    msio_exit();
 }
 
 static int request_gpios(void)
@@ -437,12 +649,35 @@ static int request_gpios(void)
             return ret;
 
         states[i].valid = true;
+        states[i].backend = BACKEND_GPIO;
+        states[i].line = button_gpios[i];
         configured++;
     }
 
+    if (!configured && use_msio_backend) {
+        ret = msio_init();
+        if (ret)
+            return ret;
+
+        for (i = 0; i < BTN_COUNT; i++) {
+            if (msio_button_lines[i] < 0)
+                continue;
+            if (msio_button_lines[i] > 0x40)
+                continue;
+            states[i].valid = true;
+            states[i].backend = BACKEND_MSIO;
+            states[i].line = msio_button_lines[i];
+            configured++;
+        }
+    }
+
     if (!configured) {
-        pr_err(DRV_NAME ": no valid button_gpios configured; set module param button_gpios=...\n");
-        return -EINVAL;
+        if (msio_ready && msio_autodiscover)
+            pr_warn(DRV_NAME ": no button lines configured; running in msio autodiscover mode\n");
+        else {
+            pr_err(DRV_NAME ": no valid inputs configured; set button_gpios=... or msio_button_lines=...\n");
+            return -EINVAL;
+        }
     }
 
     return 0;
