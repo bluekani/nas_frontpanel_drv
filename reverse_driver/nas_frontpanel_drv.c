@@ -72,14 +72,15 @@ static unsigned int threshold_ticks[BTN_COUNT] = {8, 4, 32, 4, 4};
 
 static int button_gpios[BTN_COUNT] = {-1, -1, -1, -1, -1};
 static int active_low[BTN_COUNT] = {1, 1, 1, 1, 1};
-static int msio_button_lines[BTN_COUNT] = {-1, -1, -1, -1, -1};
+/* Verified on HDL6-H F315: select=6, enter=7. Others remain unknown. */
+static int msio_button_lines[BTN_COUNT] = {-1, -1, -1, 6, 7};
 static unsigned int poll_interval_ms = 250;
 static bool invoke_sw_handler = true;
 static char *sw_handler_path = "/mnt/data/libexec/button/sw_handler";
 static bool use_msio_backend = true;
 static int msio_index_port = -1;
 static int msio_gpio_base = -1;
-static bool msio_autodiscover = true;
+static bool msio_autodiscover = false;
 
 module_param_array(button_gpios, int, NULL, 0644);
 MODULE_PARM_DESC(button_gpios, "GPIO numbers for func,power,reset,select,enter");
