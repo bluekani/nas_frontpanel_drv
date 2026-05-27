@@ -1,0 +1,65 @@
+name: Build Reverse Driver
+
+on:
+  push:
+    paths:
+      - "reverse_driver/**"
+      - ".github/workflows/build-reverse-driver.yml"
+  pull_request:
+    paths:
+      - "reverse_driver/**"
+      - ".github/workflows/build-reverse-driver.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential kmod linux-headers-generic
+
+      - name: Resolve kernel build directory
+        id: kdir
+        run: |
+          set -eux
+          KDIR=""
+
+          if [ -d "/lib/modules/$(uname -r)/build" ]; then
+            KDIR="/lib/modules/$(uname -r)/build"
+          else
+            # Fallback to the newest installed headers on runner.
+            KDIR="$(ls -d /lib/modules/*/build | sort -V | tail -n1)"
+          fi
+
+          test -n "$KDIR"
+          test -d "$KDIR"
+          echo "KDIR=$KDIR" >> "$GITHUB_OUTPUT"
+          echo "Using KDIR=$KDIR"
+
+      - name: Build module
+        run: |
+          set -eux
+          make -C reverse_driver KDIR="${{ steps.kdir.outputs.KDIR }}"
+
+      - name: Collect build outputs
+        run: |
+          set -eux
+          mkdir -p out
+          cp -v reverse_driver/*.ko out/
+          if ls reverse_driver/*.mod reverse_driver/*.mod.c reverse_driver/Module.symvers reverse_driver/modules.order >/dev/null 2>&1; then
+            cp -v reverse_driver/*.mod reverse_driver/*.mod.c reverse_driver/Module.symvers reverse_driver/modules.order out/ || true
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-driver-build
+          path: out/
+          if-no-files-found: error
