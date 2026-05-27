@@ -72,7 +72,7 @@ static unsigned int threshold_ticks[BTN_COUNT] = {8, 4, 32, 4, 4};
 
 static int button_gpios[BTN_COUNT] = {-1, -1, -1, -1, -1};
 static int active_low[BTN_COUNT] = {1, 1, 1, 1, 1};
-/* Verified on HDL6-H F315: func=0, select=6, enter=7. */
+/* Verified mapping on HDL6-H: func=0, select=6, enter=7. */
 static int msio_button_lines[BTN_COUNT] = {0, -1, -1, 6, 7};
 static unsigned int poll_interval_ms = 250;
 static bool invoke_sw_handler = true;

@@ -83,7 +83,7 @@ nas_frontpanel_drv: msio line 23 changed -> 1
 
 Then reload with `msio_button_lines=` set to discovered line numbers.
 
-Verified mapping on HDL6-H F315:
+Verified mapping on tested target:
 
 - `func=0`
 - `select=6`
@@ -117,7 +117,7 @@ setLED POWER GREEN ON
 - GPIO numbers are board-specific; set `button_gpios=` accordingly.
 - If Linux GPIO is unavailable on your board, use `msio_button_lines=` and `use_msio_backend=1`.
 - `msio_index_port=-1` auto-detects `0x2e/0x4e`; `msio_gpio_base=-1` auto-detects from SIO regs `0x62/0x63`.
-- Driver defaults currently include HDL6-H F315 verified mapping: `msio_button_lines=0,-1,-1,6,7`.
+- Driver defaults currently include the verified mapping: `msio_button_lines=0,-1,-1,6,7`.
 - Threshold ticks are reverse-engineered defaults: `8,4,32,4,4`.
 - Current remote host check (2026-05-28): no `/lib/modules/$(uname -r)/build` and no `gcc/make`,
   so module build is blocked until prerequisites are installed.
