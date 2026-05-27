@@ -426,6 +426,7 @@ static int request_gpios(void)
 {
     int i;
     int ret;
+    int configured = 0;
 
     for (i = 0; i < BTN_COUNT; i++) {
         if (!gpio_is_valid(button_gpios[i]))
@@ -436,6 +437,12 @@ static int request_gpios(void)
             return ret;
 
         states[i].valid = true;
+        configured++;
+    }
+
+    if (!configured) {
+        pr_err(DRV_NAME ": no valid button_gpios configured; set module param button_gpios=...\n");
+        return -EINVAL;
     }
 
     return 0;
