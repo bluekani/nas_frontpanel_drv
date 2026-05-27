@@ -42,11 +42,11 @@
 #define NAS_CTRL_IOW_SET_POWER_RESUME 0x40046720u
 
 enum btn_idx {
-    BTN_FUNC = 0,
-    BTN_POWER,
-    BTN_RESET,
-    BTN_SELECT,
-    BTN_ENTER,
+    FP_BTN_FUNC = 0,
+    FP_BTN_POWER,
+    FP_BTN_RESET,
+    FP_BTN_SELECT,
+    FP_BTN_ENTER,
 };
 
 static const char *const btn_names[BTN_COUNT] = {
